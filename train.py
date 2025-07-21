@@ -403,7 +403,7 @@ def train(model, perceptor, data, args):
     logging.info(f"Test AUC: {test_auc:.4f}")
     wandb.log({"Test AUC": test_auc})
 
-    '''
+    
     # === 額外評估熱門 / 冷門商品上的 AUC ===
     test_popular_idx = data.split_mask["test_popular"].cpu().nonzero(as_tuple=True)[0]
     test_unpopular_idx = data.split_mask["test_unpopular"].cpu().nonzero(as_tuple=True)[0]
@@ -436,55 +436,41 @@ def train(model, perceptor, data, args):
         "Test Unpopular AUC": test_unpopular_auc,
     })
 
-    test_hr_10 = evaluate_hr_at_k(model, source_edge_index, target_train_edge_index, data, k=10)
-    test_hr_15 = evaluate_hr_at_k(model, source_edge_index, target_train_edge_index, data, k=15)
-    test_hr_20 = evaluate_hr_at_k(model, source_edge_index, target_train_edge_index, data, k=20)
-    test_hr_25 = evaluate_hr_at_k(model, source_edge_index, target_train_edge_index, data, k=25)
-
-    logging.info(f"Test HR@10: {test_hr_10:.4f}")
-    logging.info(f"Test HR@15: {test_hr_15:.4f}")
-    logging.info(f"Test HR@20: {test_hr_20:.4f}")
-    logging.info(f"Test HR@25: {test_hr_25:.4f}")
-
-    wandb.log({
-        "Test HR@10": test_hr_10,
-        "Test HR@15": test_hr_15,
-        "Test HR@20": test_hr_20,
-        "Test HR@25": test_hr_25,
-    })
-
-    
-
-    for k in [10, 15, 20, 25]:
-        hr_popular = evaluate_hr_at_k(model, source_edge_index, target_train_edge_index, test_popular_data, k=k)
-        hr_unpopular = evaluate_hr_at_k(model, source_edge_index, target_train_edge_index, test_unpopular_data, k=k)
-
-        logging.info(f"Test HR@{k} (Popular): {hr_popular:.4f}")
-        logging.info(f"Test HR@{k} (Unpopular): {hr_unpopular:.4f}")
-
-        wandb.log({
-            f"Test HR@{k} (Popular)": hr_popular,
-            f"Test HR@{k} (Unpopular)": hr_unpopular,
-        })
-    '''
-    # === 額外評估熱門 / 冷門商品上的 HR@10 ===
+    # 複製 data，分別用於熱門與冷門測試
     test_popular_data = data.clone()
     test_unpopular_data = data.clone()
 
     test_popular_data.split_mask["test"] = data.split_mask["test_popular"]
     test_unpopular_data.split_mask["test"] = data.split_mask["test_unpopular"]
 
+    # 評估不同 k 值的 HR 與 NDCG
     for k in [10, 15, 20, 25]:
+        # 全部測試集 HR
+        hr_all = evaluate_hr_at_k(model, source_edge_index, target_train_edge_index, data, k=k)
+        logging.info(f"Test HR@{k}: {hr_all:.4f}")
+        wandb.log({f"Test HR@{k}": hr_all})
+
+        # 熱門商品 HR
+        hr_popular = evaluate_hr_at_k(model, source_edge_index, target_train_edge_index, test_popular_data, k=k)
+        logging.info(f"Test HR@{k} (Popular): {hr_popular:.4f}")
+        wandb.log({f"Test HR@{k} (Popular)": hr_popular})
+
+        # 冷門商品 HR
+        hr_unpopular = evaluate_hr_at_k(model, source_edge_index, target_train_edge_index, test_unpopular_data, k=k)
+        logging.info(f"Test HR@{k} (Unpopular): {hr_unpopular:.4f}")
+        wandb.log({f"Test HR@{k} (Unpopular)": hr_unpopular})
+
+        # 全部測試集 NDCG
         ndcg_all = evaluate_ndcg_at_k(model, source_edge_index, target_train_edge_index, data, k=k)
         wandb.log({f"Test NDCG@{k}": ndcg_all})
 
+        # 熱門商品 NDCG
         ndcg_popular = evaluate_ndcg_at_k(model, source_edge_index, target_train_edge_index, test_popular_data, k=k)
-        ndcg_unpopular = evaluate_ndcg_at_k(model, source_edge_index, target_train_edge_index, test_unpopular_data, k=k)
-
         logging.info(f"Test NDCG@{k} (Popular): {ndcg_popular:.4f}")
-        logging.info(f"Test NDCG@{k} (Unpopular): {ndcg_unpopular:.4f}")
+        wandb.log({f"Test NDCG@{k} (Popular)": ndcg_popular})
 
-        wandb.log({
-            f"Test NDCG@{k} (Popular)": ndcg_popular,
-            f"Test NDCG@{k} (Unpopular)": ndcg_unpopular,
-        })
+        # 冷門商品 NDCG
+        ndcg_unpopular = evaluate_ndcg_at_k(model, source_edge_index, target_train_edge_index, test_unpopular_data, k=k)
+        logging.info(f"Test NDCG@{k} (Unpopular): {ndcg_unpopular:.4f}")
+        wandb.log({f"Test NDCG@{k} (Unpopular)": ndcg_unpopular})
+
