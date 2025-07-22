@@ -1,12 +1,14 @@
 import logging
 import os
 from typing import Callable, Optional
-
+import numpy as np
+import math
 import pandas as pd
+import random
 import torch
 from torch.utils.data import Dataset as BaseDataset
 from torch_geometric.data import Data, Dataset, download_url
-
+from attack_utils import attack_all_items, attack_top20_percent_items, attack_source_all_items, attack_source_top20_percent_items, attack_source_cold_start_items
 from utils import get_df
 
 # Using Amazon 5-core: https://jmcauley.ucsd.edu/data/amazon/
@@ -82,7 +84,7 @@ class CrossDomain(Dataset):
     def download(self):
         for category in self.categories:
             download_url(root_url + category_file_names[category], self.raw_dir)
-
+    
     def process(self):
         logging.info("Processing...")
         df_list = []
@@ -169,7 +171,18 @@ class CrossDomain(Dataset):
             f'target sparsity: {target_df.shape[0] / len(target_df["item"].unique()) / len(target_df["user"].unique()) * 100:3f}%'
         )
 
+        #source_df = attack_source_cold_start_items(source_df)
+        target_df = attack_all_items(target_df)
         
+        target_label = torch.tensor(target_df["click"].values, dtype=torch.float)
+        target_link = torch.tensor(
+            target_df[["user", "item"]].values, dtype=torch.long
+        ).t()
+
+        source_label = torch.tensor(source_df["click"].values, dtype=torch.float)
+        source_link = torch.tensor(
+            source_df[["user", "item"]].values, dtype=torch.long
+        ).t()
 
 
         train_mask = torch.zeros(target_df.shape[0], dtype=torch.bool)
@@ -180,6 +193,8 @@ class CrossDomain(Dataset):
             test_mask[group.index[-1]] = 1
             val_mask[group.index[-2]] = 1
             train_mask[group.index[:-2]] = 1
+
+
 
         # === Popularity Bias 分析 ===
         logging.info("Splitting test set into popular vs unpopular items...")
