@@ -6,9 +6,10 @@ import math
 import pandas as pd
 import random
 import torch
+from model import Model   
 from torch.utils.data import Dataset as BaseDataset
 from torch_geometric.data import Data, Dataset, download_url
-from attack_utils import attack_all_items, attack_top20_percent_items, attack_source_all_items, attack_source_top20_percent_items, attack_source_cold_start_items
+from attack_utils import attack_all_items, attack_top20_percent_items, attack_source_all_items, attack_source_top20_percent_items, attack_source_cold_start_items, attack_all_items_weighted_forward, attack_all_items_weighted, attack_target_top1pct, attack_target_top1pct_model, attack_target_top1pct_model_dbg, attack_top1pct_fixed_users
 from utils import get_df
 
 # Using Amazon 5-core: https://jmcauley.ucsd.edu/data/amazon/
@@ -50,6 +51,7 @@ class CrossDomain(Dataset):
         categories=["Music", "Instrument"],
         target="Music",
         use_source=True,
+        model_args=None, 
         transform: Optional[Callable] = None,
         pre_transform: Optional[Callable] = None,
         pre_filter: Optional[Callable] = None,
@@ -58,6 +60,7 @@ class CrossDomain(Dataset):
         self.categories = categories
         self.target = categories[-1]
         self.use_source = use_source
+        self.model_args  = model_args   
         self.name = categories[0]
         for category in categories[1:]:
             self.name += "_" + category
@@ -170,63 +173,99 @@ class CrossDomain(Dataset):
         logging.info(
             f'target sparsity: {target_df.shape[0] / len(target_df["item"].unique()) / len(target_df["user"].unique()) * 100:3f}%'
         )
-
-        #source_df = attack_source_cold_start_items(source_df)
-        target_df = attack_all_items(target_df)
         
+        # === 在 attack 前先固定 test set & popular_items ===
+
+        # 1) 先算原始 test mask (每個 user 的最後一筆)
+        test_mask_orig = torch.zeros(target_df.shape[0], dtype=torch.bool)
+        for user, group in target_df.groupby("user"):
+            test_mask_orig[group.index[-1]] = 1
+
+        # 2) 固定 popular_items (注入前熱門商品集合)
+        item_counts_before = target_df["item"].value_counts()
+        num_top_20_percent = int(len(item_counts_before) * 0.2)
+        popular_items_fixed = set(item_counts_before.iloc[:num_top_20_percent].index)
+
+        # 3) 固定 test_df_orig (注入前的 test set)
+        test_df_orig = target_df[test_mask_orig.numpy()].copy()
+
+        logging.info(f"[Before Attack] Test interactions: {len(test_df_orig)}")
+        logging.info(f"[Before Attack] Popular items in test: {sum(test_df_orig['item'].isin(popular_items_fixed))}")
+        logging.info(f"[Before Attack] Unpopular items in test: {sum(~test_df_orig['item'].isin(popular_items_fixed))}")
+        
+        # -----------------------------------------------------
+        # === 執行 attack ===
+        # -----------------------------------------------------
+        num_users         = len(user_index)
+        num_source_items  = len(source_item_index)
+        num_target_items  = len(target_item_index)
+        #ckpt_path = "/mnt/sda1/ian94705/BiGNAS/save/2025-07-24_10:11:08_CD_Clothing.pt"
+        #ckpt_path = "/mnt/sda1/ian94705/BiGNAS/save/2025-07-23_13:28:52_CD_Kitchen.pt"
+        #ckpt_path = "/mnt/sda1/ian94705/BiGNAS/save/2025-07-25_10:40:04_Electronic_Clothing.pt"
+        if self.model_args is not None:
+            self.model_args.num_users        = num_users
+            self.model_args.num_source_items = num_source_items
+            self.model_args.num_target_items = num_target_items
+        
+        ckpt_path = "/mnt/sda1/ian94705/BiGNAS/save/2025-07-24_10:11:08_CD_Clothing.pt"
+        baseline_model = Model(self.model_args).to(self.model_args.device)
+        baseline_model.load_state_dict(torch.load(ckpt_path, map_location=self.model_args.device))
+        baseline_model.eval()
+
+        # edge_index for attack
+        se = torch.tensor(source_df[["user", "item"]].values, dtype=torch.long).t()
+        te = torch.tensor(target_df[["user", "item"]].values, dtype=torch.long).t()
+
+        # 執行攻擊，得到注入後的 target_df
+        target_df = attack_top1pct_fixed_users(
+            df   = target_df,
+            model= baseline_model,
+            source_edge_index = se,
+            target_edge_index = te,
+            top_pct = 0.01,
+            low_pct = 0.03,
+            chunk_size = 1024,
+            device  = "cuda:0"
+        )
+
+        # 轉成 tensor 用於模型
         target_label = torch.tensor(target_df["click"].values, dtype=torch.float)
-        target_link = torch.tensor(
-            target_df[["user", "item"]].values, dtype=torch.long
-        ).t()
-
+        target_link = torch.tensor(target_df[["user", "item"]].values, dtype=torch.long).t()
         source_label = torch.tensor(source_df["click"].values, dtype=torch.float)
-        source_link = torch.tensor(
-            source_df[["user", "item"]].values, dtype=torch.long
-        ).t()
-
-
+        source_link  = torch.tensor(source_df[["user", "item"]].values, dtype=torch.long).t()
+        
+        # === attack 後仍然照舊 split train/val/test (但這是給訓練用，不影響 test 分析) ===
         train_mask = torch.zeros(target_df.shape[0], dtype=torch.bool)
-        val_mask = torch.zeros(target_df.shape[0], dtype=torch.bool)
-        test_mask = torch.zeros(target_df.shape[0], dtype=torch.bool)
+        val_mask   = torch.zeros(target_df.shape[0], dtype=torch.bool)
+        test_mask  = torch.zeros(target_df.shape[0], dtype=torch.bool)
 
         for user, group in target_df.groupby("user"):
             test_mask[group.index[-1]] = 1
             val_mask[group.index[-2]] = 1
             train_mask[group.index[:-2]] = 1
 
+        # -----------------------------------------------------
+        # === Attack 後的 Popularity Bias 分析，依然用固定的 test_df_orig ===
+        # -----------------------------------------------------
 
+        test_popular_df = test_df_orig[test_df_orig["item"].isin(popular_items_fixed)].copy()
+        test_unpopular_df = test_df_orig[~test_df_orig["item"].isin(popular_items_fixed)].copy()
 
-        # === Popularity Bias 分析 ===
-        logging.info("Splitting test set into popular vs unpopular items...")
-
-        # 統計每個 item 的購買次數（整體 target_df）
-        item_counts = target_df["item"].value_counts()
-        num_top_20_percent = int(len(item_counts) * 0.2)
-        popular_items = set(item_counts.iloc[:num_top_20_percent].index)
-
-        # 從 target_df 中取出 test set
-        test_df = target_df[test_mask.numpy()].copy()
-
-        # 將 test set 分成熱門 / 非熱門商品兩類
-        test_popular_df = test_df[test_df["item"].isin(popular_items)].copy()
-        test_unpopular_df = test_df[~test_df["item"].isin(popular_items)].copy()
-
-        logging.info(f"Test interactions: {len(test_df)}")
-        logging.info(f"Popular item interactions: {len(test_popular_df)}")
-        logging.info(f"Unpopular item interactions: {len(test_unpopular_df)}")
-
-
-        # === 建立 popular/unpopular 測試用的 mask ===
         test_popular_mask = torch.zeros_like(test_mask)
         test_unpopular_mask = torch.zeros_like(test_mask)
 
-        # popular_items 是一個 set（前面已建立）
         for idx in torch.where(test_mask)[0]:
-            item_id = target_df.loc[idx.item(), "item"]
-            if item_id in popular_items:
+            item_id = target_df.loc[idx.item(), "item"]   # attack 後 test row
+            if item_id in popular_items_fixed:            # 但熱門集合是注入前固定的
                 test_popular_mask[idx] = True
             else:
                 test_unpopular_mask[idx] = True
+
+        logging.info(f"[After Attack] Test interactions (fixed): {len(test_df_orig)}")
+        logging.info(f"[After Attack] Popular item interactions: {len(test_popular_df)}")
+        logging.info(f"[After Attack] Unpopular item interactions: {len(test_unpopular_df)}")
+
+        # ✅ 不再用注入後的 test_mask 建 popular/unpopular mask，因為已經固定 test_df
 
         
         record_tot = dict()
