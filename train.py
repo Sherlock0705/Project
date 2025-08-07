@@ -3,6 +3,7 @@ import logging
 import torch
 import torch.nn as nn
 import wandb
+import numpy as np
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader
 
@@ -404,37 +405,44 @@ def train(model, perceptor, data, args):
     logging.info(f"Test AUC: {test_auc:.4f}")
     wandb.log({"Test AUC": test_auc})
 
-    test_popular_data.split_mask["test"] = data.split_mask["test_popular"]
-    test_unpopular_data.split_mask["test"] = data.split_mask["test_unpopular"]
 
-    # 評估不同 k 值的 HR 與 NDCG
+    # === 備份原始 test mask，稍後還原 ===
+    original_test_mask = data.split_mask["test"].clone()
+
+    # === 評估不同 k 值的 HR 與 NDCG ===
     for k in [10, 15, 20, 25]:
-        # === HR 評估 ===
-        #hr_all = evaluate_hr_at_k(model, source_edge_index, target_train_edge_index, data, k=k)
-        hr_popular = evaluate_hr_at_k(model, source_edge_index, target_train_edge_index, test_popular_data, k=k)
-        hr_unpopular = evaluate_hr_at_k(model, source_edge_index, target_train_edge_index, test_unpopular_data, k=k)
+        # --- 評估 popular ---
+        data.split_mask["test"] = data.split_mask["test_popular"]
+        hr_popular = evaluate_hr_at_k(model, source_edge_index, target_train_edge_index, data, k=k)
+        ndcg_popular = evaluate_ndcg_at_k(model, source_edge_index, target_train_edge_index, data, k=k)
 
+        # --- 評估 unpopular ---
+        data.split_mask["test"] = data.split_mask["test_unpopular"]
+        hr_unpopular = evaluate_hr_at_k(model, source_edge_index, target_train_edge_index, data, k=k)
+        ndcg_unpopular = evaluate_ndcg_at_k(model, source_edge_index, target_train_edge_index, data, k=k)
+
+        # --- 評估 all ---
+        data.split_mask["test"] = original_test_mask
+        hr_all = evaluate_hr_at_k(model, source_edge_index, target_train_edge_index, data, k=k)
+        ndcg_all = evaluate_ndcg_at_k(model, source_edge_index, target_train_edge_index, data, k=k)
+
+        # === Log 結果 ===
         logging.info(f"Test HR@{k} [ALL     ]: {hr_all:.4f}")
         logging.info(f"Test HR@{k} [POPULAR ]: {hr_popular:.4f}")
         logging.info(f"Test HR@{k} [UNPOPULAR]: {hr_unpopular:.4f}")
-
-        wandb.log({
-            f"Test HR@{k}": hr_all,
-            f"Test HR@{k} (Popular)": hr_popular,
-            f"Test HR@{k} (Unpopular)": hr_unpopular,
-        })
-
-        # === NDCG 評估 ===
-        #ndcg_all = evaluate_ndcg_at_k(model, source_edge_index, target_train_edge_index, data, k=k)
-        ndcg_popular = evaluate_ndcg_at_k(model, source_edge_index, target_train_edge_index, test_popular_data, k=k)
-        ndcg_unpopular = evaluate_ndcg_at_k(model, source_edge_index, target_train_edge_index, test_unpopular_data, k=k)
 
         logging.info(f"Test NDCG@{k} [ALL     ]: {ndcg_all:.4f}")
         logging.info(f"Test NDCG@{k} [POPULAR ]: {ndcg_popular:.4f}")
         logging.info(f"Test NDCG@{k} [UNPOPULAR]: {ndcg_unpopular:.4f}")
 
         wandb.log({
+            f"Test HR@{k}": hr_all,
+            f"Test HR@{k} (Popular)": hr_popular,
+            f"Test HR@{k} (Unpopular)": hr_unpopular,
             f"Test NDCG@{k}": ndcg_all,
             f"Test NDCG@{k} (Popular)": ndcg_popular,
             f"Test NDCG@{k} (Unpopular)": ndcg_unpopular,
         })
+
+    # === 還原原本的 test mask（以防後續再用） ===
+    data.split_mask["test"] = original_test_mask
