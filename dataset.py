@@ -1,17 +1,13 @@
 import logging
 import os
 from typing import Callable, Optional
-import numpy as np
-import math
+
 import pandas as pd
-import random
 import torch
-from model import Model   
 from torch.utils.data import Dataset as BaseDataset
 from torch_geometric.data import Data, Dataset, download_url
-from attack_utils import attack_all_items, attack_top20_percent_items, attack_source_all_items, attack_source_top20_percent_items, attack_source_cold_start_items, attack_all_items_weighted_forward, attack_all_items_weighted, attack_target_top1pct, attack_target_top1pct_model, attack_target_top1pct_model_dbg, attack_top1pct_fixed_users
 from utils import get_df
-
+from experiment import analyze_user_top_item_coverage
 # Using Amazon 5-core: https://jmcauley.ucsd.edu/data/amazon/
 root_url = "http://snap.stanford.edu/data/amazon/productGraph/categoryFiles/"
 
@@ -51,7 +47,6 @@ class CrossDomain(Dataset):
         categories=["Music", "Instrument"],
         target="Music",
         use_source=True,
-        model_args=None, 
         transform: Optional[Callable] = None,
         pre_transform: Optional[Callable] = None,
         pre_filter: Optional[Callable] = None,
@@ -60,7 +55,6 @@ class CrossDomain(Dataset):
         self.categories = categories
         self.target = categories[-1]
         self.use_source = use_source
-        self.model_args  = model_args   
         self.name = categories[0]
         for category in categories[1:]:
             self.name += "_" + category
@@ -87,7 +81,7 @@ class CrossDomain(Dataset):
     def download(self):
         for category in self.categories:
             download_url(root_url + category_file_names[category], self.raw_dir)
-    
+
     def process(self):
         logging.info("Processing...")
         df_list = []
@@ -173,101 +167,64 @@ class CrossDomain(Dataset):
         logging.info(
             f'target sparsity: {target_df.shape[0] / len(target_df["item"].unique()) / len(target_df["user"].unique()) * 100:3f}%'
         )
-        
-        # === 在 attack 前先固定 test set & popular_items ===
 
-        # 1) 先算原始 test mask (每個 user 的最後一筆)
-        test_mask_orig = torch.zeros(target_df.shape[0], dtype=torch.bool)
+        analyze_user_top_item_coverage(target_df,k_percent=0.01)
+
+        # 🔍 找出 target domain 中購買次數最多的 item（Top-1 熱門）
+        most_popular_item = target_df["item"].value_counts().idxmax()
+        top_items = {most_popular_item}  # 用 set 保留後續相容性
+
+        logging.info(f"[Top-1 熱門 item] ID: {most_popular_item}")
+
+        # 🔍 分析 user 對這個 item 的互動情況
+        user_with_top_item = set()
+        user_all = set(target_df["user"].unique())
+
         for user, group in target_df.groupby("user"):
-            test_mask_orig[group.index[-1]] = 1
+            items = set(group["item"].values)
+            if items & top_items:
+                user_with_top_item.add(user)
 
-        # 2) 固定 popular_items (注入前熱門商品集合)
-        item_counts_before = target_df["item"].value_counts()
-        num_top_20_percent = int(len(item_counts_before) * 0.2)
-        popular_items_fixed = set(item_counts_before.iloc[:num_top_20_percent].index)
+        user_without_top_item = user_all - user_with_top_item
 
-        # 3) 固定 test_df_orig (注入前的 test set)
-        test_df_orig = target_df[test_mask_orig.numpy()].copy()
+        logging.info(f"[Top-1 熱門 item] 有買過的 user 數量: {len(user_with_top_item)}")
+        logging.info(f"[Top-1 熱門 item] 完全沒買過的 user 數量: {len(user_without_top_item)}")
 
-        logging.info(f"[Before Attack] Test interactions: {len(test_df_orig)}")
-        logging.info(f"[Before Attack] Popular items in test: {sum(test_df_orig['item'].isin(popular_items_fixed))}")
-        logging.info(f"[Before Attack] Unpopular items in test: {sum(~test_df_orig['item'].isin(popular_items_fixed))}")
-        
-        # -----------------------------------------------------
-        # === 執行 attack ===
-        # -----------------------------------------------------
-        num_users         = len(user_index)
-        num_source_items  = len(source_item_index)
-        num_target_items  = len(target_item_index)
-        #ckpt_path = "/mnt/sda1/ian94705/BiGNAS/save/2025-07-24_10:11:08_CD_Clothing.pt"
-        #ckpt_path = "/mnt/sda1/ian94705/BiGNAS/save/2025-07-23_13:28:52_CD_Kitchen.pt"
-        #ckpt_path = "/mnt/sda1/ian94705/BiGNAS/save/2025-07-25_10:40:04_Electronic_Clothing.pt"
-        if self.model_args is not None:
-            self.model_args.num_users        = num_users
-            self.model_args.num_source_items = num_source_items
-            self.model_args.num_target_items = num_target_items
-        
-        ckpt_path = "/mnt/sda1/ian94705/BiGNAS/save/2025-07-24_10:11:08_CD_Clothing.pt"
-        baseline_model = Model(self.model_args).to(self.model_args.device)
-        baseline_model.load_state_dict(torch.load(ckpt_path, map_location=self.model_args.device))
-        baseline_model.eval()
 
-        # edge_index for attack
-        se = torch.tensor(source_df[["user", "item"]].values, dtype=torch.long).t()
-        te = torch.tensor(target_df[["user", "item"]].values, dtype=torch.long).t()
-
-        # 執行攻擊，得到注入後的 target_df
-        target_df = attack_top1pct_fixed_users(
-            df   = target_df,
-            model= baseline_model,
-            source_edge_index = se,
-            target_edge_index = te,
-            top_pct = 0.01,
-            low_pct = 0.03,
-            chunk_size = 1024,
-            device  = "cuda:0"
-        )
-
-        # 轉成 tensor 用於模型
-        target_label = torch.tensor(target_df["click"].values, dtype=torch.float)
-        target_link = torch.tensor(target_df[["user", "item"]].values, dtype=torch.long).t()
-        source_label = torch.tensor(source_df["click"].values, dtype=torch.float)
-        source_link  = torch.tensor(source_df[["user", "item"]].values, dtype=torch.long).t()
-        
-        # === attack 後仍然照舊 split train/val/test (但這是給訓練用，不影響 test 分析) ===
         train_mask = torch.zeros(target_df.shape[0], dtype=torch.bool)
-        val_mask   = torch.zeros(target_df.shape[0], dtype=torch.bool)
-        test_mask  = torch.zeros(target_df.shape[0], dtype=torch.bool)
+        val_mask = torch.zeros(target_df.shape[0], dtype=torch.bool)
+        test_mask = torch.zeros(target_df.shape[0], dtype=torch.bool)
+        
 
         for user, group in target_df.groupby("user"):
             test_mask[group.index[-1]] = 1
             val_mask[group.index[-2]] = 1
             train_mask[group.index[:-2]] = 1
 
-        # -----------------------------------------------------
-        # === Attack 後的 Popularity Bias 分析，依然用固定的 test_df_orig ===
-        # -----------------------------------------------------
+        # ✅ Step 1: 統計 target item 熱門程度（先不受後續攻擊影響）
+        item_counts = target_df["item"].value_counts()
+        num_total_items = len(item_counts)
+        num_popular_items = int(num_total_items * 0.2)
+        popular_items = set(item_counts.nlargest(num_popular_items).index)
 
-        test_popular_df = test_df_orig[test_df_orig["item"].isin(popular_items_fixed)].copy()
-        test_unpopular_df = test_df_orig[~test_df_orig["item"].isin(popular_items_fixed)].copy()
+        logging.info(f"[統計] target item 數量: {num_total_items}")
+        logging.info(f"[統計] popular item 數量: {len(popular_items)}")
 
-        test_popular_mask = torch.zeros_like(test_mask)
-        test_unpopular_mask = torch.zeros_like(test_mask)
+        # ✅ Step 2: popular / unpopular test mask 建立
+        popular_test_mask = torch.zeros_like(test_mask)
+        unpopular_test_mask = torch.zeros_like(test_mask)
 
         for idx in torch.where(test_mask)[0]:
-            item_id = target_df.loc[idx.item(), "item"]   # attack 後 test row
-            if item_id in popular_items_fixed:            # 但熱門集合是注入前固定的
-                test_popular_mask[idx] = True
+            item = target_df.loc[idx.item(), "item"]
+            if item in popular_items:
+                popular_test_mask[idx] = 1
             else:
-                test_unpopular_mask[idx] = True
+                unpopular_test_mask[idx] = 1
 
-        logging.info(f"[After Attack] Test interactions (fixed): {len(test_df_orig)}")
-        logging.info(f"[After Attack] Popular item interactions: {len(test_popular_df)}")
-        logging.info(f"[After Attack] Unpopular item interactions: {len(test_unpopular_df)}")
+        logging.info(f"[統計] 原始 test 互動數量: {test_mask.sum().item()}")
+        logging.info(f"[統計] popular test 數量: {popular_test_mask.sum().item()}")
+        logging.info(f"[統計] unpopular test 數量: {unpopular_test_mask.sum().item()}")
 
-        # ✅ 不再用注入後的 test_mask 建 popular/unpopular mask，因為已經固定 test_df
-
-        
         record_tot = dict()
         for user, group in df.groupby("user"):
             tot = group.shape[0]
@@ -285,8 +242,8 @@ class CrossDomain(Dataset):
                 "train": train_mask,
                 "valid": val_mask,
                 "test": test_mask,
-                "test_popular": test_popular_mask,
-                "test_unpopular": test_unpopular_mask,
+                "test_popular": popular_test_mask,
+                "test_unpopular": unpopular_test_mask,
             },
             num_users=len(user_index),
             num_source_items=len(source_item_index),
