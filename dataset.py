@@ -168,8 +168,12 @@ class CrossDomain(Dataset):
             f'target sparsity: {target_df.shape[0] / len(target_df["item"].unique()) / len(target_df["user"].unique()) * 100:3f}%'
         )
 
-        analyze_user_top_item_coverage(target_df,k_percent=0.01)
-
+        result = analyze_user_top_item_coverage(target_df,k_percent=0.03)
+        top_items = result["top_items"]
+        user_with_top_item = result["user_with_top_item"]
+        user_without_top_item = result["user_without_top_item"]
+        
+        '''
         # 🔍 找出 target domain 中購買次數最多的 item（Top-1 熱門）
         most_popular_item = target_df["item"].value_counts().idxmax()
         top_items = {most_popular_item}  # 用 set 保留後續相容性
@@ -189,7 +193,7 @@ class CrossDomain(Dataset):
 
         logging.info(f"[Top-1 熱門 item] 有買過的 user 數量: {len(user_with_top_item)}")
         logging.info(f"[Top-1 熱門 item] 完全沒買過的 user 數量: {len(user_without_top_item)}")
-
+        '''
 
         train_mask = torch.zeros(target_df.shape[0], dtype=torch.bool)
         val_mask = torch.zeros(target_df.shape[0], dtype=torch.bool)
