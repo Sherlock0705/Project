@@ -12,7 +12,6 @@ from dataset import Dataset
 from pytorchtools import EarlyStopping
 from utils import link_split, load_model
 
-
 def meta_optimizeation(
     target_meta_loader,
     replace_optimizer,
@@ -142,6 +141,8 @@ def evaluate_ndcg_at_k(model, source_edge_index, target_edge_index, data, k=10, 
     ndcg_at_k = ndcg_total / len(user_pos_items)
     logging.info(f"NDCG@{k}: {ndcg_at_k:.4f}")
     return ndcg_at_k
+
+
 
 
 def train(model, perceptor, data, args):
@@ -435,14 +436,13 @@ def train(model, perceptor, data, args):
         "Test Popular AUC": test_popular_auc,
         "Test Unpopular AUC": test_unpopular_auc,
     })
-
+    
     # 複製 data，分別用於熱門與冷門測試
     test_popular_data = data.clone()
     test_unpopular_data = data.clone()
 
     test_popular_data.split_mask["test"] = data.split_mask["test_popular"]
     test_unpopular_data.split_mask["test"] = data.split_mask["test_unpopular"]
-
     # 評估不同 k 值的 HR 與 NDCG
     for k in [10, 15, 20, 25]:
         # 全部測試集 HR
@@ -473,4 +473,5 @@ def train(model, perceptor, data, args):
         ndcg_unpopular = evaluate_ndcg_at_k(model, source_edge_index, target_train_edge_index, test_unpopular_data, k=k)
         logging.info(f"Test NDCG@{k} (Unpopular): {ndcg_unpopular:.4f}")
         wandb.log({f"Test NDCG@{k} (Unpopular)": ndcg_unpopular})
-
+        
+        
