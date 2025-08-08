@@ -175,7 +175,7 @@ class CrossDomain(Dataset):
         user_without_top_item = result["user_without_top_item"]
 
         pt_path = "/mnt/sda1/qwerty/BiGNAS/save/2025-08-08_08:28:55_CD_Kitchen.pt"
-        hard_users = get_hard_users(pt_path, user_with_top_item, user_without_top_item, top_percent=0.1)
+        hard_users = get_hard_users(pt_path, user_with_top_item, user_without_top_item, top_percent=0.01)
 
         print("要改動的使用者 index：", hard_users)
         print("人數為:", len(hard_users))
@@ -221,38 +221,37 @@ class CrossDomain(Dataset):
         logging.info(f"[統計] target item 數量: {num_total_items}")
         logging.info(f"[統計] popular item 數量: {len(popular_items)}")
 
-        # ✅ Step 2: popular / unpopular test mask 建立
-        popular_test_mask = torch.zeros_like(test_mask)
-        unpopular_test_mask = torch.zeros_like(test_mask)
+                # === Step 2: 攻擊 ===
+        target_df = attack_target_top1pct(target_df, 0.03, hard_users)
 
-        for idx in torch.where(test_mask)[0]:
-            item = target_df.loc[idx.item(), "item"]
-            if item in popular_items:
-                popular_test_mask[idx] = 1
-            else:
-                unpopular_test_mask[idx] = 1
-
-        logging.info(f"[統計] 原始 test 互動數量: {test_mask.sum().item()}")
-        logging.info(f"[統計] popular test 數量: {popular_test_mask.sum().item()}")
-        logging.info(f"[統計] unpopular test 數量: {unpopular_test_mask.sum().item()}")
-
-
-        # ✅ Step 3: ATTACK
-        target_df = attack_target_top1pct(target_df,0.03, hard_users)
-        target_df = df[df["is_target"] == 1].copy() 
-
-        target_df = df[df["is_target"] == 1].copy()
-        target_df.reset_index(drop=True, inplace=True)
-        target_item_index = {}
-        for idx, item in enumerate(target_df["item"].unique()):
-            target_item_index[item] = idx
-        target_df["item"] = target_df["item"].apply(lambda x: target_item_index[x])
-        target_df["item"] += len(user_index)
-
+        # 重新生成 target_label / target_link
         target_label = torch.tensor(target_df["click"].values, dtype=torch.float)
         target_link = torch.tensor(
             target_df[["user", "item"]].values, dtype=torch.long
         ).t()
+
+        # === Step 3: 攻擊後生成 train/val/test mask（長度正確）===
+        train_mask = torch.zeros(target_df.shape[0], dtype=torch.bool)
+        val_mask = torch.zeros(target_df.shape[0], dtype=torch.bool)
+        test_mask = torch.zeros(target_df.shape[0], dtype=torch.bool)
+
+        for user, group in target_df.groupby("user"):
+            test_mask[group.index[-1]] = 1
+            val_mask[group.index[-2]] = 1
+            train_mask[group.index[:-2]] = 1
+
+        # === Step 4: 用攻擊前的 popular_items 生成 popular/unpopular 測試 mask ===
+        test_popular_mask = torch.zeros_like(test_mask)
+        test_unpopular_mask = torch.zeros_like(test_mask)
+
+        for idx in torch.where(test_mask)[0]:
+            item = target_df.loc[idx.item(), "item"]
+            if item in popular_items:
+                test_popular_mask[idx] = 1
+            else:
+                test_unpopular_mask[idx] = 1
+
+        
 
         record_tot = dict()
         for user, group in df.groupby("user"):
@@ -271,8 +270,8 @@ class CrossDomain(Dataset):
                 "train": train_mask,
                 "valid": val_mask,
                 "test": test_mask,
-                "test_popular": popular_test_mask,
-                "test_unpopular": unpopular_test_mask,
+                "test_popular": test_popular_mask,
+                "test_unpopular": test_unpopular_mask,
             },
             num_users=len(user_index),
             num_source_items=len(source_item_index),
